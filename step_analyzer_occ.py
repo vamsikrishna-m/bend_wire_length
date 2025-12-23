@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import math
 
-# OpenCASCADE imports
+# OpenCASCADE importsyyy
 from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.TopExp import TopExp_Explorer
