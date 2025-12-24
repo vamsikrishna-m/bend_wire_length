@@ -1,6 +1,6 @@
 """
-STEP File Wire Analyzer - TRUE CATIA Compatible
-Calculates bend angle from tangent lines like CATIA does
+STEP File Wire Analyzer - FINAL CATIA-EXACT Match
+Calculates bend angle between adjacent straight segments (CATIA method)
 """
 
 import numpy as np
@@ -13,7 +13,7 @@ from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
 from OCC.Core.GeomAbs import GeomAbs_Line, GeomAbs_Circle
-from OCC.Core.gp import gp_Pnt, gp_Dir
+from OCC.Core.gp import gp_Pnt
 from OCC.Core.TopoDS import TopoDS_Edge
 from OCC.Extend.TopologyUtils import TopologyExplorer, WireExplorer
 
@@ -42,10 +42,6 @@ class Point3D:
     @staticmethod
     def from_gp_Pnt(pnt: gp_Pnt) -> 'Point3D':
         return Point3D(pnt.X(), pnt.Y(), pnt.Z())
-    
-    @staticmethod
-    def from_gp_Dir(d: gp_Dir) -> 'Point3D':
-        return Point3D(d.X(), d.Y(), d.Z())
 
 
 class WireSegment:
@@ -59,8 +55,7 @@ class WireSegment:
         self.center = None
         self.sub_edges = []
         self.arc_length = None
-        self.start_tangent = None
-        self.end_tangent = None
+        self.direction = None  # For straight segments
 
 
 class STEPWireAnalyzer:
@@ -118,41 +113,13 @@ class STEPWireAnalyzer:
         print()
         return self.edges
     
-    def calculate_bend_angle_from_tangents(self, start_tan: Point3D, end_tan: Point3D) -> float:
-        """
-        Calculate bend angle from tangent vectors (CATIA method)
-        The bend angle is the angle BETWEEN the tangent lines, which is
-        the SUPPLEMENT of the angle between the tangent vectors
-        
-        For a 90° bend, tangents are perpendicular, so this returns 90°
-        """
-        v1 = start_tan.to_array()
-        v2 = end_tan.to_array()
-        
-        # Normalize
-        v1_norm = v1 / (np.linalg.norm(v1) + 1e-10)
-        v2_norm = v2 / (np.linalg.norm(v2) + 1e-10)
-        
-        # Angle between tangent vectors
-        cos_angle = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-        angle_between_tangents = math.degrees(np.arccos(cos_angle))
-        
-        # CATIA measures the bend angle, which is the supplement
-        # (180° - angle_between_tangents) for the interior angle
-        bend_angle = 180.0 - angle_between_tangents
-        
-        return bend_angle
-    
     def analyze_edge(self, edge: TopoDS_Edge, idx: int) -> Optional[WireSegment]:
         try:
             adaptor = BRepAdaptor_Curve(edge)
             curve_type = adaptor.GetType()
             
-            first_param = adaptor.FirstParameter()
-            last_param = adaptor.LastParameter()
-            
-            start_pnt = adaptor.Value(first_param)
-            end_pnt = adaptor.Value(last_param)
+            start_pnt = adaptor.Value(adaptor.FirstParameter())
+            end_pnt = adaptor.Value(adaptor.LastParameter())
             
             start = Point3D.from_gp_Pnt(start_pnt)
             end = Point3D.from_gp_Pnt(end_pnt)
@@ -170,13 +137,9 @@ class STEPWireAnalyzer:
                 seg = WireSegment('STRAIGHT', start, end)
                 seg.length = arc_length
                 
-                # Store tangent for bend calculation
-                try:
-                    tangent_dir = adaptor.DN(first_param, 1)
-                    seg.start_tangent = Point3D.from_gp_Dir(gp_Dir(tangent_dir))
-                    seg.end_tangent = seg.start_tangent
-                except:
-                    pass
+                # Store direction vector for angle calculation
+                direction = end.to_array() - start.to_array()
+                seg.direction = direction / (np.linalg.norm(direction) + 1e-10)
                 
                 return seg
                 
@@ -190,36 +153,20 @@ class STEPWireAnalyzer:
                 seg.radius = radius
                 seg.center = Point3D.from_gp_Pnt(center_pnt)
                 seg.arc_length = arc_length
-                
-                # Get tangent vectors at start and end of arc
-                try:
-                    start_tangent = adaptor.DN(first_param, 1)
-                    end_tangent = adaptor.DN(last_param, 1)
-                    
-                    seg.start_tangent = Point3D.from_gp_Dir(gp_Dir(start_tangent))
-                    seg.end_tangent = Point3D.from_gp_Dir(gp_Dir(end_tangent))
-                    
-                    # Calculate bend angle from tangents (CATIA way)
-                    seg.angle_deg = self.calculate_bend_angle_from_tangents(
-                        seg.start_tangent, seg.end_tangent
-                    )
-                except Exception as e:
-                    # Fallback to geometric calculation
-                    v1 = start.to_array() - seg.center.to_array()
-                    v2 = end.to_array() - seg.center.to_array()
-                    v1_norm = v1 / (np.linalg.norm(v1) + 1e-10)
-                    v2_norm = v2 / (np.linalg.norm(v2) + 1e-10)
-                    cos_angle = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-                    seg.angle_deg = math.degrees(np.arccos(cos_angle))
-                
-                # Length is arc length
                 seg.length = arc_length
+                
+                # Don't calculate angle here - will be calculated after consolidation
+                # based on adjacent straight segments
                 
                 return seg
             
             else:
                 seg = WireSegment('STRAIGHT', start, end)
                 seg.length = arc_length
+                
+                direction = end.to_array() - start.to_array()
+                seg.direction = direction / (np.linalg.norm(direction) + 1e-10)
+                
                 return seg
                 
         except Exception as e:
@@ -263,14 +210,12 @@ class STEPWireAnalyzer:
             
             prev = to_merge[-1]
             if prev.end.distance_to(next_seg.start) < 0.1:
-                d1 = (prev.end.to_array() - prev.start.to_array())
-                d1 = d1 / (np.linalg.norm(d1) + 1e-10)
-                d2 = (next_seg.end.to_array() - next_seg.start.to_array())
-                d2 = d2 / (np.linalg.norm(d2) + 1e-10)
-                
-                if abs(np.dot(d1, d2) - 1.0) < 0.01:
-                    to_merge.append(next_seg)
-                    i += 1
+                if prev.direction is not None and next_seg.direction is not None:
+                    if abs(np.dot(prev.direction, next_seg.direction) - 1.0) < 0.01:
+                        to_merge.append(next_seg)
+                        i += 1
+                    else:
+                        break
                 else:
                     break
             else:
@@ -280,9 +225,10 @@ class STEPWireAnalyzer:
         merged.length = sum(s.length for s in to_merge)
         merged.sub_edges = to_merge if len(to_merge) > 1 else []
         
-        if to_merge[0].start_tangent:
-            merged.start_tangent = to_merge[0].start_tangent
-            merged.end_tangent = to_merge[-1].end_tangent
+        # Merged direction
+        if to_merge[0].direction is not None:
+            direction = merged.end.to_array() - merged.start.to_array()
+            merged.direction = direction / (np.linalg.norm(direction) + 1e-10)
         
         return merged
     
@@ -313,32 +259,59 @@ class STEPWireAnalyzer:
         merged.center = first.center
         merged.sub_edges = to_merge if len(to_merge) > 1 else []
         
-        # Use first and last tangents for angle calculation
-        if to_merge[0].start_tangent and to_merge[-1].end_tangent:
-            merged.start_tangent = to_merge[0].start_tangent
-            merged.end_tangent = to_merge[-1].end_tangent
-            merged.angle_deg = self.calculate_bend_angle_from_tangents(
-                merged.start_tangent, merged.end_tangent
-            )
-        else:
-            # Fallback
-            v1 = merged.start.to_array() - merged.center.to_array()
-            v2 = merged.end.to_array() - merged.center.to_array()
-            v1_norm = v1 / (np.linalg.norm(v1) + 1e-10)
-            v2_norm = v2 / (np.linalg.norm(v2) + 1e-10)
-            cos_angle = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-            merged.angle_deg = math.degrees(np.arccos(cos_angle))
-        
         # Total arc length
         total_arc_length = sum(s.arc_length for s in to_merge if s.arc_length)
         merged.arc_length = total_arc_length
         merged.length = total_arc_length
         
+        # Angle will be calculated later based on adjacent straights
+        
         return merged
+    
+    def calculate_bend_angles(self):
+        """
+        Calculate bend angles based on adjacent straight segments (CATIA method)
+        This must be called after consolidation
+        """
+        for i, seg in enumerate(self.segments):
+            if seg.type != 'BEND':
+                continue
+            
+            # Find previous and next straight segments
+            prev_straight = None
+            next_straight = None
+            
+            for j in range(i - 1, -1, -1):
+                if self.segments[j].type == 'STRAIGHT':
+                    prev_straight = self.segments[j]
+                    break
+            
+            for j in range(i + 1, len(self.segments)):
+                if self.segments[j].type == 'STRAIGHT':
+                    next_straight = self.segments[j]
+                    break
+            
+            # Calculate angle between the straight segments
+            if prev_straight and next_straight:
+                if prev_straight.direction is not None and next_straight.direction is not None:
+                    # Angle between directions
+                    cos_angle = np.dot(prev_straight.direction, next_straight.direction)
+                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                    
+                    # This is the angle between the direction vectors
+                    angle_between_dirs = math.degrees(np.arccos(cos_angle))
+                    
+                    # The bend angle is the supplement of this angle
+                    # (180° - angle_between_directions)
+                    seg.angle_deg = 180.0 - angle_between_dirs
+                    
+                    # Ensure angle is in reasonable range
+                    if seg.angle_deg < 0.1:
+                        seg.angle_deg = 180.0
     
     def analyze_all_segments(self):
         print("=" * 70)
-        print("ANALYZING (TRUE CATIA Method)")
+        print("ANALYZING (CATIA-EXACT Method)")
         print("=" * 70)
         
         self.raw_segments = []
@@ -350,6 +323,9 @@ class STEPWireAnalyzer:
         print(f"✓ {len(self.raw_segments)} raw segments\n")
         
         self.segments = self.consolidate_segments()
+        
+        # Calculate bend angles based on adjacent straights (CATIA method!)
+        self.calculate_bend_angles()
         
         self.bend_count = sum(1 for s in self.segments if s.type == 'BEND')
         self.straight_count = sum(1 for s in self.segments if s.type == 'STRAIGHT')
@@ -397,11 +373,12 @@ class STEPWireAnalyzer:
 
 def analyze_step_file(step_file_path: str):
     """
-    Analyze STEP file with TRUE CATIA-compatible measurements
+    Analyze STEP file with CATIA-EXACT measurements
+    Calculates bend angles from adjacent straight segments like CATIA
     """
     print("\n" + "#" * 70)
     print(f"# {Path(step_file_path).name}")
-    print(f"# TRUE CATIA-Compatible Analysis")
+    print(f"# CATIA-EXACT Analysis")
     print("#" * 70 + "\n")
     
     analyzer = STEPWireAnalyzer(step_file_path)
