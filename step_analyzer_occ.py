@@ -1,6 +1,7 @@
 """
-STEP File Wire Analyzer - CATIA EXACT Formula Match
-Uses CATIA's bend development length calculation
+STEP File Wire Analyzer - TRUE CATIA Formula
+Uses CATIA's exact bend allowance calculation:
+V = α×(R+K×T) - 2×(R+T)×tan(min(π/2,α)/2)
 """
 
 import numpy as np
@@ -56,15 +57,17 @@ class WireSegment:
         self.sub_edges = []
         self.arc_length = None
         self.direction = None
+        self.bend_allowance = None
 
 
 class STEPWireAnalyzer:
     
-    def __init__(self, step_file_path: str, bend_method: str = 'tangent_offset'):
+    def __init__(self, step_file_path: str, thickness: float = 0.0, k_factor: float = None):
         """
         Args:
             step_file_path: Path to STEP file
-            bend_method: 'arc' (pure arc), 'tangent_offset' (CATIA method), or 'mean_line'
+            thickness: Material thickness T (0 for wire)
+            k_factor: K-factor for neutral axis (auto-calculated if None)
         """
         self.step_file = Path(step_file_path)
         self.shape = None
@@ -74,8 +77,68 @@ class STEPWireAnalyzer:
         self.total_length = 0.0
         self.bend_count = 0
         self.straight_count = 0
-        self.bend_method = bend_method
+        self.thickness = thickness
+        self.k_factor = k_factor
         
+    def calculate_k_factor(self, radius: float) -> float:
+        """
+        Calculate K-factor using CATIA's DIN standard formula:
+        K = (0.65 + log10(R/T)) / 2
+        
+        For wire (T=0), use default K=0.33
+        """
+        if self.k_factor is not None:
+            return self.k_factor
+        
+        if self.thickness <= 0.001:
+            # For wire bending (no thickness), use default
+            return 0.33
+        
+        # CATIA DIN formula
+        ratio = radius / self.thickness
+        k = (0.65 + math.log10(ratio)) / 2.0
+        
+        # Clamp between 0 and 0.5
+        return max(0.0, min(0.5, k))
+    
+    def calculate_bend_allowance_catia(self, radius: float, angle_deg: float) -> float:
+        """
+        CATIA's exact bend allowance formula:
+        V = α×(R+K×T) - 2×(R+T)×tan(min(π/2,α)/2)
+        
+        Where:
+        - α = bend angle in radians
+        - R = inside bend radius
+        - T = material thickness
+        - K = K-factor (position of neutral fiber)
+        
+        For wire (T≈0), this simplifies to:
+        V = α×R - 2×R×tan(α/2)
+        """
+        
+        # Convert angle to radians
+        alpha = math.radians(angle_deg)
+        
+        # Get K-factor
+        K = self.calculate_k_factor(radius)
+        
+        # CATIA formula
+        R = radius
+        T = self.thickness
+        
+        # First term: arc length along neutral axis
+        neutral_arc = alpha * (R + K * T)
+        
+        # Second term: deduction for straight approximation
+        # Use min(π/2, α) as per CATIA spec
+        alpha_limited = min(math.pi / 2.0, alpha)
+        deduction = 2.0 * (R + T) * math.tan(alpha_limited / 2.0)
+        
+        # Bend allowance
+        bend_allowance = neutral_arc - deduction
+        
+        return bend_allowance
+    
     def load_step_file(self) -> bool:
         print(f"Loading: {self.step_file.name}")
         
@@ -119,43 +182,6 @@ class STEPWireAnalyzer:
         print()
         return self.edges
     
-    def calculate_developed_length_catia(self, radius: float, angle_deg: float, arc_length: float) -> float:
-        """
-        Calculate developed length using CATIA's method
-        
-        CATIA uses: Developed Length = 2 × R × tan(θ/2)
-        This gives the length along the tangent lines from bend start to end
-        
-        For R=25mm, θ=90°:
-        L = 2 × 25 × tan(45°) = 2 × 25 × 1 = 50mm
-        
-        But we need to add the arc contribution...
-        
-        Actually CATIA formula for wire bending is:
-        L = R × θ × (π/180) + R × [tan(θ/2) - θ×π/180]
-        
-        Simplified: L = R × tan(θ/2) × 2
-        """
-        
-        if self.bend_method == 'arc':
-            # Pure arc length
-            return arc_length
-        
-        elif self.bend_method == 'tangent_offset':
-            # CATIA wire bend formula: L = 2 × R × tan(θ/2)
-            angle_rad = math.radians(angle_deg)
-            developed = 2.0 * radius * math.tan(angle_rad / 2.0)
-            return developed
-        
-        elif self.bend_method == 'mean_line':
-            # Mean line with K-factor (for sheet metal)
-            # L = (π/180) × θ × (R + K×t)
-            # For wire (no thickness), this is just arc length
-            return arc_length
-        
-        else:
-            return arc_length
-    
     def analyze_edge(self, edge: TopoDS_Edge, idx: int) -> Optional[WireSegment]:
         try:
             adaptor = BRepAdaptor_Curve(edge)
@@ -196,7 +222,6 @@ class STEPWireAnalyzer:
                 seg.center = Point3D.from_gp_Pnt(center_pnt)
                 seg.arc_length = arc_length
                 
-                # Store for later angle calculation
                 return seg
             
             else:
@@ -297,14 +322,15 @@ class STEPWireAnalyzer:
         merged.center = first.center
         merged.sub_edges = to_merge if len(to_merge) > 1 else []
         
-        # Total arc length
         total_arc_length = sum(s.arc_length for s in to_merge if s.arc_length)
         merged.arc_length = total_arc_length
         
         return merged
     
-    def calculate_bend_angles(self):
-        """Calculate bend angles from adjacent straight segments"""
+    def calculate_bend_angles_and_allowances(self):
+        """
+        Calculate bend angles from adjacent straights and apply CATIA bend allowance
+        """
         for i, seg in enumerate(self.segments):
             if seg.type != 'BEND':
                 continue
@@ -324,19 +350,28 @@ class STEPWireAnalyzer:
             
             if prev_straight and next_straight:
                 if prev_straight.direction is not None and next_straight.direction is not None:
+                    # Calculate angle between straights
                     cos_angle = np.dot(prev_straight.direction, next_straight.direction)
                     cos_angle = np.clip(cos_angle, -1.0, 1.0)
                     angle_between = math.degrees(np.arccos(cos_angle))
                     seg.angle_deg = 180.0 - angle_between
                     
-                    # Now calculate developed length with the angle
-                    seg.length = self.calculate_developed_length_catia(
-                        seg.radius, seg.angle_deg, seg.arc_length
+                    # Calculate CATIA bend allowance
+                    seg.bend_allowance = self.calculate_bend_allowance_catia(
+                        seg.radius, seg.angle_deg
                     )
+                    
+                    # Set length to bend allowance
+                    seg.length = seg.bend_allowance
     
     def analyze_all_segments(self):
         print("=" * 70)
-        print(f"ANALYZING (CATIA Method: {self.bend_method})")
+        print("ANALYZING (CATIA EXACT Formula)")
+        print(f"Thickness: {self.thickness:.3f} mm")
+        if self.k_factor:
+            print(f"K-factor: {self.k_factor:.3f} (manual)")
+        else:
+            print(f"K-factor: Auto-calculated per bend")
         print("=" * 70)
         
         self.raw_segments = []
@@ -348,7 +383,7 @@ class STEPWireAnalyzer:
         print(f"✓ {len(self.raw_segments)} raw segments\n")
         
         self.segments = self.consolidate_segments()
-        self.calculate_bend_angles()
+        self.calculate_bend_angles_and_allowances()
         
         self.bend_count = sum(1 for s in self.segments if s.type == 'BEND')
         self.straight_count = sum(1 for s in self.segments if s.type == 'STRAIGHT')
@@ -358,12 +393,16 @@ class STEPWireAnalyzer:
     
     def print_results(self):
         print("=" * 70)
-        print(f"SEGMENT DETAILS (Method: {self.bend_method})")
+        print("SEGMENT DETAILS (CATIA Formula)")
         print("=" * 70)
         
         for i, seg in enumerate(self.segments, 1):
             print(f"\nSegment {i}: {seg.type}")
-            print(f"  Developed Length: {seg.length:.2f} mm")
+            
+            if seg.type == 'STRAIGHT':
+                print(f"  Length: {seg.length:.2f} mm")
+            else:
+                print(f"  Bend Allowance: {seg.length:.2f} mm")
             
             if seg.sub_edges:
                 print(f"  (Merged from {len(seg.sub_edges)} edges)")
@@ -375,9 +414,13 @@ class STEPWireAnalyzer:
                     print(f"  Angle: {seg.angle_deg:.2f}°")
                 if seg.arc_length:
                     print(f"  Arc Length: {seg.arc_length:.2f} mm")
+                    
+                # Show K-factor used
+                K = self.calculate_k_factor(seg.radius)
+                print(f"  K-factor: {K:.3f}")
         
         print("\n" + "=" * 70)
-        print(f"WIRE ANALYSIS SUMMARY (Method: {self.bend_method})")
+        print("WIRE ANALYSIS SUMMARY (CATIA Formula)")
         print("=" * 70)
         print(f"\nTotal Developed Length: {self.total_length:.2f} mm")
         print(f"Number of Bends:        {self.bend_count}")
@@ -388,26 +431,31 @@ class STEPWireAnalyzer:
             bend_num = 1
             for seg in self.segments:
                 if seg.type == 'BEND':
-                    print(f"  Bend {bend_num}: R={seg.radius:.2f}mm, θ={seg.angle_deg:.2f}°, L={seg.length:.2f}mm")
+                    print(f"  Bend {bend_num}: R={seg.radius:.2f}mm, θ={seg.angle_deg:.2f}°, BA={seg.bend_allowance:.2f}mm")
                     bend_num += 1
         
-        print("\n" + "=" * 70 + "\n")
+        print("\n" + "=" * 70)
+        print("Formula Used:")
+        print("V = α×(R+K×T) - 2×(R+T)×tan(min(π/2,α)/2)")
+        print(f"Where T={self.thickness:.3f}mm")
+        print("=" * 70 + "\n")
 
 
-def analyze_step_file(step_file_path: str, method: str = 'tangent_offset'):
+def analyze_step_file(step_file_path: str, thickness: float = 0.0, k_factor: float = None):
     """
-    Analyze STEP file with CATIA bend calculation
+    Analyze STEP file using CATIA's exact bend allowance formula
     
     Args:
         step_file_path: Path to STEP file
-        method: 'arc', 'tangent_offset' (CATIA default), or 'mean_line'
+        thickness: Material thickness in mm (0 for wire)
+        k_factor: K-factor (None for auto-calculation)
     """
     print("\n" + "#" * 70)
     print(f"# {Path(step_file_path).name}")
-    print(f"# CATIA Analysis - Method: {method}")
+    print(f"# CATIA EXACT Formula Analysis")
     print("#" * 70 + "\n")
     
-    analyzer = STEPWireAnalyzer(step_file_path, bend_method=method)
+    analyzer = STEPWireAnalyzer(step_file_path, thickness=thickness, k_factor=k_factor)
     analyzer.load_step_file()
     analyzer.extract_edges()
     analyzer.analyze_all_segments()
@@ -421,8 +469,10 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1:
         step_file = sys.argv[1]
-        method = sys.argv[2] if len(sys.argv) > 2 else 'tangent_offset'
-        analyzer = analyze_step_file(step_file, method)
+        thickness = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+        k_factor = float(sys.argv[3]) if len(sys.argv) > 3 else None
+        analyzer = analyze_step_file(step_file, thickness, k_factor)
     else:
-        print("Usage: python step_analyzer_catia.py <step_file> [method]")
-        print("Methods: 'arc', 'tangent_offset' (default), 'mean_line'")
+        print("Usage: python step_analyzer_catia.py <step_file> [thickness] [k_factor]")
+        print("Example: python step_analyzer_catia.py wire.step 0 0.33")
+        print("         python step_analyzer_catia.py sheet.step 2.0 0.4")
