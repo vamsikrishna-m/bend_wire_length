@@ -1,6 +1,6 @@
 """
-STEP File Wire Analyzer - CATIA Compatible Version
-Matches CATIA's bend measurement methodology
+STEP File Wire Analyzer - TRUE CATIA Compatible
+Calculates bend angle from tangent lines like CATIA does
 """
 
 import numpy as np
@@ -13,7 +13,7 @@ from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
 from OCC.Core.GeomAbs import GeomAbs_Line, GeomAbs_Circle
-from OCC.Core.gp import gp_Pnt
+from OCC.Core.gp import gp_Pnt, gp_Dir
 from OCC.Core.TopoDS import TopoDS_Edge
 from OCC.Extend.TopologyUtils import TopologyExplorer, WireExplorer
 
@@ -42,6 +42,10 @@ class Point3D:
     @staticmethod
     def from_gp_Pnt(pnt: gp_Pnt) -> 'Point3D':
         return Point3D(pnt.X(), pnt.Y(), pnt.Z())
+    
+    @staticmethod
+    def from_gp_Dir(d: gp_Dir) -> 'Point3D':
+        return Point3D(d.X(), d.Y(), d.Z())
 
 
 class WireSegment:
@@ -54,21 +58,14 @@ class WireSegment:
         self.angle_deg = None
         self.center = None
         self.sub_edges = []
-        # CATIA-specific measurements
-        self.arc_length = None  # Pure arc length
-        self.developed_length = None  # CATIA-style developed length
+        self.arc_length = None
+        self.start_tangent = None
+        self.end_tangent = None
 
 
 class STEPWireAnalyzer:
     
-    def __init__(self, step_file_path: str, k_factor: float = 0.33):
-        """
-        Initialize analyzer with CATIA-compatible measurements
-        
-        Args:
-            step_file_path: Path to STEP file
-            k_factor: Bend allowance K-factor (default 0.33, typical for sheet metal)
-        """
+    def __init__(self, step_file_path: str):
         self.step_file = Path(step_file_path)
         self.shape = None
         self.edges = []
@@ -77,7 +74,6 @@ class STEPWireAnalyzer:
         self.total_length = 0.0
         self.bend_count = 0
         self.straight_count = 0
-        self.k_factor = k_factor
         
     def load_step_file(self) -> bool:
         print(f"Loading: {self.step_file.name}")
@@ -122,41 +118,46 @@ class STEPWireAnalyzer:
         print()
         return self.edges
     
-    def calculate_bend_angle_from_geometry(self, start: Point3D, end: Point3D, 
-                                          center: Point3D, radius: float) -> float:
+    def calculate_bend_angle_from_tangents(self, start_tan: Point3D, end_tan: Point3D) -> float:
         """
-        Calculate the ACTUAL bend angle using vector geometry
-        This matches CATIA's angle calculation
-        """
-        # Vectors from center to start and end points
-        v1 = start.to_array() - center.to_array()
-        v2 = end.to_array() - center.to_array()
+        Calculate bend angle from tangent vectors (CATIA method)
+        The bend angle is the angle BETWEEN the tangent lines, which is
+        the SUPPLEMENT of the angle between the tangent vectors
         
-        # Normalize vectors
+        For a 90° bend, tangents are perpendicular, so this returns 90°
+        """
+        v1 = start_tan.to_array()
+        v2 = end_tan.to_array()
+        
+        # Normalize
         v1_norm = v1 / (np.linalg.norm(v1) + 1e-10)
         v2_norm = v2 / (np.linalg.norm(v2) + 1e-10)
         
-        # Calculate angle using dot product
+        # Angle between tangent vectors
         cos_angle = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
-        angle_rad = np.arccos(cos_angle)
+        angle_between_tangents = math.degrees(np.arccos(cos_angle))
         
-        # Convert to degrees
-        angle_deg = math.degrees(angle_rad)
+        # CATIA measures the bend angle, which is the supplement
+        # (180° - angle_between_tangents) for the interior angle
+        bend_angle = 180.0 - angle_between_tangents
         
-        return angle_deg
+        return bend_angle
     
     def analyze_edge(self, edge: TopoDS_Edge, idx: int) -> Optional[WireSegment]:
         try:
             adaptor = BRepAdaptor_Curve(edge)
             curve_type = adaptor.GetType()
             
-            start_pnt = adaptor.Value(adaptor.FirstParameter())
-            end_pnt = adaptor.Value(adaptor.LastParameter())
+            first_param = adaptor.FirstParameter()
+            last_param = adaptor.LastParameter()
+            
+            start_pnt = adaptor.Value(first_param)
+            end_pnt = adaptor.Value(last_param)
             
             start = Point3D.from_gp_Pnt(start_pnt)
             end = Point3D.from_gp_Pnt(end_pnt)
             
-            # Get arc length (actual curve length)
+            # Get arc length
             if HAS_GCPNTS:
                 try:
                     arc_length = GCPnts_AbscissaPoint.Length_s(adaptor)
@@ -168,6 +169,15 @@ class STEPWireAnalyzer:
             if curve_type == GeomAbs_Line:
                 seg = WireSegment('STRAIGHT', start, end)
                 seg.length = arc_length
+                
+                # Store tangent for bend calculation
+                try:
+                    tangent_dir = adaptor.DN(first_param, 1)
+                    seg.start_tangent = Point3D.from_gp_Dir(gp_Dir(tangent_dir))
+                    seg.end_tangent = seg.start_tangent
+                except:
+                    pass
+                
                 return seg
                 
             elif curve_type == GeomAbs_Circle:
@@ -176,25 +186,34 @@ class STEPWireAnalyzer:
                 circle = adaptor.Circle()
                 radius = circle.Radius()
                 center_pnt = circle.Location()
-                center = Point3D.from_gp_Pnt(center_pnt)
                 
                 seg.radius = radius
-                seg.center = center
+                seg.center = Point3D.from_gp_Pnt(center_pnt)
                 seg.arc_length = arc_length
                 
-                # CORRECT ANGLE: Calculate from geometry, not arc length
-                seg.angle_deg = self.calculate_bend_angle_from_geometry(
-                    start, end, center, radius
-                )
+                # Get tangent vectors at start and end of arc
+                try:
+                    start_tangent = adaptor.DN(first_param, 1)
+                    end_tangent = adaptor.DN(last_param, 1)
+                    
+                    seg.start_tangent = Point3D.from_gp_Dir(gp_Dir(start_tangent))
+                    seg.end_tangent = Point3D.from_gp_Dir(gp_Dir(end_tangent))
+                    
+                    # Calculate bend angle from tangents (CATIA way)
+                    seg.angle_deg = self.calculate_bend_angle_from_tangents(
+                        seg.start_tangent, seg.end_tangent
+                    )
+                except Exception as e:
+                    # Fallback to geometric calculation
+                    v1 = start.to_array() - seg.center.to_array()
+                    v2 = end.to_array() - seg.center.to_array()
+                    v1_norm = v1 / (np.linalg.norm(v1) + 1e-10)
+                    v2_norm = v2 / (np.linalg.norm(v2) + 1e-10)
+                    cos_angle = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+                    seg.angle_deg = math.degrees(np.arccos(cos_angle))
                 
-                # Calculate developed length (CATIA-style)
-                # This uses bend allowance formula
-                seg.developed_length = self.calculate_developed_length(
-                    radius, seg.angle_deg
-                )
-                
-                # Use developed length as the segment length (CATIA way)
-                seg.length = seg.developed_length
+                # Length is arc length
+                seg.length = arc_length
                 
                 return seg
             
@@ -206,24 +225,6 @@ class STEPWireAnalyzer:
         except Exception as e:
             print(f"Warning: edge {idx}: {e}")
             return None
-    
-    def calculate_developed_length(self, radius: float, angle_deg: float) -> float:
-        """
-        Calculate developed length using bend allowance formula
-        This matches CATIA's calculation
-        
-        Formula: L = (π/180) × Angle × (R + K×t)
-        For wire bending (no thickness): L = (π/180) × Angle × R
-        
-        But CATIA may use: L = 2 × R × tan(Angle/2) for the straight equivalent
-        """
-        angle_rad = math.radians(angle_deg)
-        
-        # Method 1: Standard bend allowance (neutral axis)
-        neutral_radius = radius  # For wire, neutral axis is at center
-        developed = (math.pi / 180.0) * angle_deg * neutral_radius
-        
-        return developed
     
     def consolidate_segments(self):
         print("=" * 70)
@@ -240,12 +241,10 @@ class STEPWireAnalyzer:
             current = self.raw_segments[i]
             
             if current.type == 'BEND':
-                # Merge consecutive arcs with same center/radius
                 merged = self._merge_arcs(i)
                 consolidated.append(merged)
                 i += len(merged.sub_edges) if merged.sub_edges else 1
             else:
-                # Merge collinear straights
                 merged = self._merge_straights(i)
                 consolidated.append(merged)
                 i += len(merged.sub_edges) if merged.sub_edges else 1
@@ -264,7 +263,6 @@ class STEPWireAnalyzer:
             
             prev = to_merge[-1]
             if prev.end.distance_to(next_seg.start) < 0.1:
-                # Check direction
                 d1 = (prev.end.to_array() - prev.start.to_array())
                 d1 = d1 / (np.linalg.norm(d1) + 1e-10)
                 d2 = (next_seg.end.to_array() - next_seg.start.to_array())
@@ -281,6 +279,11 @@ class STEPWireAnalyzer:
         merged = WireSegment('STRAIGHT', to_merge[0].start, to_merge[-1].end)
         merged.length = sum(s.length for s in to_merge)
         merged.sub_edges = to_merge if len(to_merge) > 1 else []
+        
+        if to_merge[0].start_tangent:
+            merged.start_tangent = to_merge[0].start_tangent
+            merged.end_tangent = to_merge[-1].end_tangent
+        
         return merged
     
     def _merge_arcs(self, start_idx):
@@ -298,7 +301,6 @@ class STEPWireAnalyzer:
             if not next_seg.center or not next_seg.radius:
                 break
             
-            # Same center and radius?
             if (first.center.distance_to(next_seg.center) < 0.1 and 
                 abs(first.radius - next_seg.radius) < 0.1):
                 to_merge.append(next_seg)
@@ -311,28 +313,32 @@ class STEPWireAnalyzer:
         merged.center = first.center
         merged.sub_edges = to_merge if len(to_merge) > 1 else []
         
-        # Calculate total angle from merged geometry
-        merged.angle_deg = self.calculate_bend_angle_from_geometry(
-            merged.start, merged.end, merged.center, merged.radius
-        )
+        # Use first and last tangents for angle calculation
+        if to_merge[0].start_tangent and to_merge[-1].end_tangent:
+            merged.start_tangent = to_merge[0].start_tangent
+            merged.end_tangent = to_merge[-1].end_tangent
+            merged.angle_deg = self.calculate_bend_angle_from_tangents(
+                merged.start_tangent, merged.end_tangent
+            )
+        else:
+            # Fallback
+            v1 = merged.start.to_array() - merged.center.to_array()
+            v2 = merged.end.to_array() - merged.center.to_array()
+            v1_norm = v1 / (np.linalg.norm(v1) + 1e-10)
+            v2_norm = v2 / (np.linalg.norm(v2) + 1e-10)
+            cos_angle = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+            merged.angle_deg = math.degrees(np.arccos(cos_angle))
         
-        # Calculate arc length
+        # Total arc length
         total_arc_length = sum(s.arc_length for s in to_merge if s.arc_length)
         merged.arc_length = total_arc_length
-        
-        # Calculate developed length
-        merged.developed_length = self.calculate_developed_length(
-            merged.radius, merged.angle_deg
-        )
-        
-        # Use developed length as segment length
-        merged.length = merged.developed_length
+        merged.length = total_arc_length
         
         return merged
     
     def analyze_all_segments(self):
         print("=" * 70)
-        print("ANALYZING (CATIA-Compatible)")
+        print("ANALYZING (TRUE CATIA Method)")
         print("=" * 70)
         
         self.raw_segments = []
@@ -353,12 +359,12 @@ class STEPWireAnalyzer:
     
     def print_results(self):
         print("=" * 70)
-        print("SEGMENT DETAILS (CATIA-Compatible)")
+        print("SEGMENT DETAILS (CATIA Method)")
         print("=" * 70)
         
         for i, seg in enumerate(self.segments, 1):
             print(f"\nSegment {i}: {seg.type}")
-            print(f"  Developed Length: {seg.length:.2f} mm")
+            print(f"  Length: {seg.length:.2f} mm")
             
             if seg.sub_edges:
                 print(f"  (Merged from {len(seg.sub_edges)} edges)")
@@ -372,41 +378,33 @@ class STEPWireAnalyzer:
                     print(f"  Arc Length: {seg.arc_length:.2f} mm")
         
         print("\n" + "=" * 70)
-        print("WIRE ANALYSIS SUMMARY (CATIA-Compatible)")
+        print("WIRE ANALYSIS SUMMARY (CATIA Method)")
         print("=" * 70)
-        print(f"\nTotal Developed Length: {self.total_length:.2f} mm")
-        print(f"Number of Bends:        {self.bend_count}")
-        print(f"Straight Segments:      {self.straight_count}")
+        print(f"\nTotal Length:        {self.total_length:.2f} mm")
+        print(f"Number of Bends:     {self.bend_count}")
+        print(f"Straight Segments:   {self.straight_count}")
         
         if self.bend_count > 0:
             print(f"\nBend Details:")
             bend_num = 1
             for seg in self.segments:
                 if seg.type == 'BEND':
-                    print(f"  Bend {bend_num}:")
-                    print(f"    Radius: {seg.radius:.2f} mm")
-                    print(f"    Angle: {seg.angle_deg:.2f}°")
-                    print(f"    Arc Length: {seg.arc_length:.2f} mm")
-                    print(f"    Developed Length: {seg.developed_length:.2f} mm")
+                    print(f"  Bend {bend_num}: R={seg.radius:.2f}mm, θ={seg.angle_deg:.2f}°, L={seg.length:.2f}mm")
                     bend_num += 1
         
         print("\n" + "=" * 70 + "\n")
 
 
-def analyze_step_file(step_file_path: str, k_factor: float = 0.33):
+def analyze_step_file(step_file_path: str):
     """
-    Analyze STEP file with CATIA-compatible measurements
-    
-    Args:
-        step_file_path: Path to STEP file
-        k_factor: Bend allowance K-factor (default 0.33)
+    Analyze STEP file with TRUE CATIA-compatible measurements
     """
     print("\n" + "#" * 70)
     print(f"# {Path(step_file_path).name}")
-    print(f"# CATIA-Compatible Analysis")
+    print(f"# TRUE CATIA-Compatible Analysis")
     print("#" * 70 + "\n")
     
-    analyzer = STEPWireAnalyzer(step_file_path, k_factor=k_factor)
+    analyzer = STEPWireAnalyzer(step_file_path)
     analyzer.load_step_file()
     analyzer.extract_edges()
     analyzer.analyze_all_segments()
@@ -420,8 +418,6 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1:
         step_file = sys.argv[1]
-        k_factor = float(sys.argv[2]) if len(sys.argv) > 2 else 0.33
-        analyzer = analyze_step_file(step_file, k_factor=k_factor)
+        analyzer = analyze_step_file(step_file)
     else:
-        print("Usage: python step_analyzer_catia.py <step_file> [k_factor]")
-        print("Example: python step_analyzer_catia.py wire.step 0.33")
+        print("Usage: python step_analyzer_catia.py <step_file>")
