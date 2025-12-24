@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from step_analyzer_occ import analyze_step_file
+from step_analyzer_final import analyze_step_file
 
 
 def plot_wire_3d(analyzer, title="Wire Geometry", show_segment_numbers=True):
