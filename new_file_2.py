@@ -158,10 +158,6 @@ class UniversalPipeLengthCalculator:
                     if abs(seg["length"] - m["length"]) > tol:
                         continue
                     
-                    # Check radius (LARGE tolerance for pipe wall thickness variations)
-                    if abs(seg["radius"] - m["radius"]) > radius_tol:
-                        continue
-                    
                     # Check if axes are the same
                     if "axis_dir" in seg and "axis_dir" in m:
                         if not self._parallel(seg["axis_dir"], m["axis_dir"], tol=1e-3):
@@ -173,6 +169,8 @@ class UniversalPipeLengthCalculator:
                             m["axis_dir"]
                         )
                         
+                        # If same length AND coaxial -> it's a duplicate (inner/outer wall)
+                        # DO NOT check radius - inner and outer walls have different radii!
                         if axis_dist < tol:
                             duplicate = True
                             if self.debug:
@@ -180,13 +178,12 @@ class UniversalPipeLengthCalculator:
                 
                 # ─── CIRCULAR BENDS ───
                 elif seg["type"] == "CIRCULAR_BEND":
-                    if abs(seg["radius"] - m["radius"]) > radius_tol:
-                        continue
-                    
+                    # Check angle (must match closely)
                     if abs(seg.get("angle_deg", 0) - m.get("angle_deg", 0)) > 0.5:
                         continue
                     
                     # Check if centers are close (same bend)
+                    # DO NOT check radius - inner and outer bends have different radii!
                     if "center" in seg and "center" in m:
                         center_dist = math.sqrt(
                             (seg["center"][0] - m["center"][0])**2 +
