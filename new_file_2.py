@@ -1,7 +1,6 @@
 import sys
 import math
 from pathlib import Path
-from collections import defaultdict
 
 from OCP.STEPControl import STEPControl_Reader, STEPControl_Writer, STEPControl_AsIs
 from OCP.IFSelect import IFSelect_RetDone
@@ -18,16 +17,14 @@ from OCP.TopExp import TopExp
 
 class UniversalPipeLengthCalculator:
     """
-    Universal pipe length calculator that:
-    - Separates individual pipes in complex assemblies
-    - Traces centerlines for each pipe independently
-    - Works for straight pipes, bends, and complex geometries
+    Keeps EXACT same merging logic as original advanced_fixed.py
+    ONLY adds: separation of individual pipes in assemblies
     """
     
     def __init__(self, step_file):
         self.step_file = step_file
         self.shape = None
-        self.pipes = []  # List of individual pipes
+        self.pipes = []
         self.debug = True
         
     def load_step(self):
@@ -64,7 +61,7 @@ class UniversalPipeLengthCalculator:
             face = TopoDS.Face_s(exp.Current())
             surf = BRepAdaptor_Surface(face)
             
-            # ─── CYLINDER (STRAIGHT SECTION) ───
+            # ─── CYLINDER (STRAIGHT) ───
             if surf.GetType() == GeomAbs_Cylinder:
                 cyl = surf.Cylinder()
                 length = abs(surf.LastVParameter() - surf.FirstVParameter())
@@ -99,7 +96,7 @@ class UniversalPipeLengthCalculator:
                         "pipe_id": pipe_id
                     })
             
-            # ─── TORUS (BEND/ELBOW) ───
+            # ─── TORUS (BEND) ───
             elif surf.GetType() == GeomAbs_Torus:
                 tor = surf.Torus()
                 angle = abs(surf.LastUParameter() - surf.FirstUParameter())
@@ -125,7 +122,7 @@ class UniversalPipeLengthCalculator:
         
         return segments
     
-    def _parallel(self, d1, d2, tol=1e-3):
+    def _parallel(self, d1, d2, tol=1e-4):
         """Check if two direction vectors are parallel"""
         dot = d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2]
         return abs(abs(dot) - 1.0) < tol
@@ -138,24 +135,15 @@ class UniversalPipeLengthCalculator:
         cz = vx*d[1] - vy*d[0]
         return math.sqrt(cx*cx + cy*cy + cz*cz)
     
-    def _distance_3d(self, p1, p2):
-        """Calculate 3D distance between two points"""
-        return math.sqrt(
-            (p1[0] - p2[0])**2 +
-            (p1[1] - p2[1])**2 +
-            (p1[2] - p2[2])**2
-        )
-    
-    def merge_duplicate_segments(self, segments):
+    def merge_duplicates(self, segments, tol=1e-2):
         """
-        Merge duplicate segments from inner/outer pipe walls.
-        This only merges duplicates WITHIN the same pipe.
+        EXACT SAME LOGIC AS ORIGINAL advanced_fixed.py
+        Remove duplicate segments created by opposite faces
         """
         merged = []
         
-        # Group tolerance: allow 1mm radius difference (inner vs outer wall)
-        radius_tol = 1.0
-        position_tol = 0.01  # 0.01mm for position matching
+        # RADIUS TOLERANCE: Allow larger difference for inner/outer pipe walls
+        radius_tol = 1.0  # 1mm tolerance for radius (handles inner vs outer wall)
         
         for seg in segments:
             duplicate = False
@@ -166,40 +154,51 @@ class UniversalPipeLengthCalculator:
                 
                 # ─── STRAIGHT SEGMENTS ───
                 if seg["type"] == "STRAIGHT":
-                    # Check length
-                    if abs(seg["length"] - m["length"]) > position_tol:
+                    # Check length (relaxed tolerance)
+                    if abs(seg["length"] - m["length"]) > tol:
                         continue
                     
-                    # Check radius (allow difference for wall thickness)
+                    # Check radius (LARGE tolerance for pipe wall thickness variations)
                     if abs(seg["radius"] - m["radius"]) > radius_tol:
                         continue
                     
-                    # Check if axes are parallel and coaxial
-                    if not self._parallel(seg["axis_dir"], m["axis_dir"]):
-                        continue
-                    
-                    axis_dist = self._point_to_axis_distance(
-                        seg["axis_origin"],
-                        m["axis_origin"],
-                        m["axis_dir"]
-                    )
-                    
-                    if axis_dist < position_tol:
-                        duplicate = True
+                    # Check if axes are the same
+                    if "axis_dir" in seg and "axis_dir" in m:
+                        if not self._parallel(seg["axis_dir"], m["axis_dir"], tol=1e-3):
+                            continue
+                        
+                        axis_dist = self._point_to_axis_distance(
+                            seg["axis_origin"],
+                            m["axis_origin"],
+                            m["axis_dir"]
+                        )
+                        
+                        if axis_dist < tol:
+                            duplicate = True
+                            if self.debug:
+                                print(f"  Duplicate found: L={seg['length']:.2f} R={seg['radius']:.2f} matches L={m['length']:.2f} R={m['radius']:.2f}")
                 
                 # ─── CIRCULAR BENDS ───
                 elif seg["type"] == "CIRCULAR_BEND":
-                    # Check radius
                     if abs(seg["radius"] - m["radius"]) > radius_tol:
                         continue
                     
-                    # Check angle
                     if abs(seg.get("angle_deg", 0) - m.get("angle_deg", 0)) > 0.5:
                         continue
                     
-                    # Check if centers match
-                    center_dist = self._distance_3d(seg["center"], m["center"])
-                    if center_dist < position_tol * 10:
+                    # Check if centers are close (same bend)
+                    if "center" in seg and "center" in m:
+                        center_dist = math.sqrt(
+                            (seg["center"][0] - m["center"][0])**2 +
+                            (seg["center"][1] - m["center"][1])**2 +
+                            (seg["center"][2] - m["center"][2])**2
+                        )
+                        if center_dist < tol * 10:  # 10x tolerance for center matching
+                            duplicate = True
+                            if self.debug:
+                                print(f"  Duplicate bend found: R={seg['radius']:.2f} ∠={seg['angle_deg']:.1f}°")
+                    else:
+                        # Fallback if no center info
                         duplicate = True
                 
                 if duplicate:
@@ -228,8 +227,8 @@ class UniversalPipeLengthCalculator:
             raw_segments = self.extract_pipe_segments(solid, pipe_id)
             print(f"  Found {len(raw_segments)} raw segments")
             
-            # Merge duplicates (inner/outer wall)
-            merged_segments = self.merge_duplicate_segments(raw_segments)
+            # Merge duplicates using ORIGINAL logic
+            merged_segments = self.merge_duplicates(raw_segments)
             print(f"  After merge: {len(merged_segments)} unique segments")
             
             # Calculate total length for this pipe
@@ -285,6 +284,27 @@ class UniversalPipeLengthCalculator:
         
         return grand_total
     
+    def build_centerline_wire(self, segments):
+        """Build a TopoDS_Wire representing the centerline"""
+        wire_builder = BRepBuilderAPI_MakeWire()
+        
+        for seg in segments:
+            if seg["type"] == "STRAIGHT":
+                try:
+                    p1 = gp_Pnt(*seg["start_point"])
+                    p2 = gp_Pnt(*seg["end_point"])
+                    
+                    edge_maker = BRepBuilderAPI_MakeEdge(p1, p2)
+                    if edge_maker.IsDone():
+                        edge = edge_maker.Edge()
+                        wire_builder.Add(edge)
+                except:
+                    pass
+        
+        if wire_builder.IsDone():
+            return wire_builder.Wire()
+        return None
+    
     def export_centerlines_step(self, output_file):
         """Export all pipe centerlines to a single STEP file"""
         print(f"\n💾 Exporting centerlines to STEP: {output_file}")
@@ -293,23 +313,8 @@ class UniversalPipeLengthCalculator:
         total_exported = 0
         
         for pipe in self.pipes:
-            wire_builder = BRepBuilderAPI_MakeWire()
-            
-            for seg in pipe["segments"]:
-                if seg["type"] == "STRAIGHT":
-                    try:
-                        p1 = gp_Pnt(*seg["start_point"])
-                        p2 = gp_Pnt(*seg["end_point"])
-                        
-                        edge_maker = BRepBuilderAPI_MakeEdge(p1, p2)
-                        if edge_maker.IsDone():
-                            edge = edge_maker.Edge()
-                            wire_builder.Add(edge)
-                    except:
-                        pass
-            
-            if wire_builder.IsDone():
-                wire = wire_builder.Wire()
+            wire = self.build_centerline_wire(pipe["segments"])
+            if wire:
                 writer.Transfer(wire, STEPControl_AsIs)
                 total_exported += 1
         
@@ -326,7 +331,7 @@ class UniversalPipeLengthCalculator:
         """Main calculation pipeline"""
         print("="*60)
         print("UNIVERSAL PIPE LENGTH CALCULATOR")
-        print("Handles: Single pipes, Bends, Complex assemblies")
+        print("Same merging logic as advanced_fixed.py")
         print("="*60)
         
         self.load_step()
